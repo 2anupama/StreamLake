@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Test and tooling output
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# Local data and logs
+data/**
+!data/**/
+!data/**/.gitkeep
+logs/**
+!logs/.gitkeep
+*.duckdb
+*.duckdb.wal
+
+# Platform output
+airflow/logs/
+dbt/target/
+dbt/logs/
+spark-warehouse/
+.DS_Store

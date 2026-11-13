@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "streamlake"
+version = "0.1.0"
+description = "Real-time data ingestion and analytics platform foundation"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "pydantic-settings==2.10.1",
+    "python-dotenv==1.1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+    "pytest-cov==7.0.0",
+]
+batch = [
+    "openpyxl==3.1.5",
+    "pandas==2.3.3",
+    "requests==2.32.5",
+]
+postgres = [
+    "psycopg[binary]==3.2.10",
+    "sqlalchemy==2.0.44",
+]
+kafka = [
+    "confluent-kafka==2.11.1",
+]
+spark = [
+    "pyspark==4.0.1",
+]
+analytics = [
+    "duckdb==1.4.1",
+    "pyarrow==21.0.0",
+]
+gcp = [
+    "google-cloud-bigquery==3.38.0",
+    "google-cloud-storage==3.4.1",
+]
+dbt = [
+    "dbt-bigquery==1.10.2",
+]
+
+[project.scripts]
+streamlake = "streamlake.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["streamlake*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers --strict-config"
+log_cli = true
+log_cli_level = "INFO"
+
+[tool.coverage.run]
+branch = true
+source = ["streamlake"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

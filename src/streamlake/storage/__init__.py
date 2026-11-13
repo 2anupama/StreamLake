@@ -1,0 +1,1 @@
+"""Local and cloud storage interfaces and adapters."""

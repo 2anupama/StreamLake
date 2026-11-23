@@ -428,4 +428,86 @@ events. A repeated dbt build retained those counts.
 `dbt build --target local` completed **64/64** nodes successfully (23 models,
 one snapshot, and 41 data tests). The full unit suite completed with **28
 passed**, including Spark transformation, ordering, and quality tests. `pip check`
-reported no broken requirements. Phase 3 is complete; Phase 4 has not started.
+reported no broken requirements.
+
+## Phase 4: Airflow Workflow Orchestration
+
+Airflow 3.4.0 runs in a separate local Compose project, using the official
+`apache/airflow:3.4.0-python3.11` image, LocalExecutor, and a dedicated
+PostgreSQL 16.4 metadata database. The image adds Java 21 for the finite
+PySpark batch job plus the existing StreamLake batch, analytics, dbt, and test
+dependencies. Airflow does not launch the Kafka consumer: Kafka, Kafka Connect,
+and the Phase 2 streaming consumer remain independently managed services.
+
+Start Airflow from the repository root:
+
+```zsh
+docker compose -f docker-compose.airflow.yml up airflow-init
+docker compose -f docker-compose.airflow.yml up -d
+```
+
+Open <http://localhost:8080> and sign in as `airflow`. On first startup,
+Airflow generates its local SimpleAuthManager password in
+`airflow/config/simple_auth_manager_passwords.json.generated`; read that
+git-ignored file for the password. Keep the UI bound to a trusted local machine.
+The API server, scheduler, DAG processor, and metadata database have health
+checks. Airflow logs are under `airflow/logs/`; the generated local auth
+password file is under `airflow/config/` and is git-ignored.
+The Compose file shares its local API signing key across services; set
+`STREAMLAKE_AIRFLOW_API_SECRET_KEY` in the shell or an ignored `.env` file to
+replace the development default.
+
+The scheduled `streamlake_batch_ingestion` DAG runs daily at 02:00 UTC by
+default (`STREAMLAKE_BATCH_SCHEDULE` changes the cron schedule). It discovers
+CSV/XLS inputs, skips completed content fingerprints, validates schemas,
+ingests selected files through the existing BatchPipeline, runs the finite
+Phase 3 Spark transform, verifies Silver and quality outputs, checks Gold,
+runs `dbt build --target local`, and writes a run audit JSON to
+`data/airflow/audit/`. Row validation failures are quarantined by the existing
+ingestion and quality stages; missing columns or unreadable files fail the
+Airflow task. Tasks use two retries, a one-minute local retry delay, two-hour task
+timeouts, and a configurable callback via
+`STREAMLAKE_AIRFLOW_FAILURE_CALLBACK=package.module:function`.
+
+The other DAGs support explicit Bronze-to-Silver, Silver-to-Gold, daily data
+quality, dbt-only, and daily reconciliation runs. They are named
+`streamlake_bronze_to_silver`, `streamlake_silver_to_gold`,
+`streamlake_data_quality`, `streamlake_dbt_transformation`, and
+`streamlake_daily_reconciliation`. Daily quality runs at 03:00 UTC and
+reconciliation at 04:00 UTC. All DAGs disable catchup and limit active runs
+to one.
+
+Trigger a batch from the UI, or from the CLI with optional parameters:
+
+```zsh
+docker compose -f docker-compose.airflow.yml exec airflow-api-server \
+  airflow dags trigger streamlake_batch_ingestion \
+  --conf '{"input_dir":"data/incoming","reprocess":false}'
+```
+
+`input_dir` must be a directory under the mounted project. Set `reprocess` to
+true to select completed inputs again. For historical replay, pass `batch_id`
+or `start_date` and `end_date` in `YYYY-MM-DD` format; matching source files
+must still be present in the selected input directory. Batch ingestion itself
+retains fingerprint idempotence, while Spark, quality, Gold verification, and
+dbt rebuild current output state. Keep archived source versions if a historical
+file has since changed.
+
+Select a DAG run in the UI to inspect task status, duration, logs, retries, and
+XCom results. Failed tasks can be cleared and retried from the Grid view. Each
+successful main run writes batch ID, Airflow run ID, timestamps, duration,
+processed/rejected counts, and reconciliation status to its audit JSON. Daily
+reconciliation writes a separate report to `data/airflow/reconciliation/`.
+
+Run the orchestration checks in the Airflow image (the host Python environment
+does not need Airflow installed):
+
+```zsh
+docker compose -f docker-compose.airflow.yml exec airflow-api-server \
+  python -m pytest /opt/streamlake/tests/airflow -q
+```
+
+The required local run is the `streamlake_batch_ingestion` DAG. Wait for all
+tasks, including Spark and dbt, to finish successfully before considering
+Phase 4 complete. Airflow task logs are the source for live task start/end
+times; the audit report captures pipeline-level timing and record counts.

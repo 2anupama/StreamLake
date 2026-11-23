@@ -35,6 +35,10 @@ logs/**
 
 # Platform output
 airflow/logs/
+airflow/config/simple_auth_manager_passwords.json.generated
+airflow/config/airflow.cfg
+airflow/__pycache__/
+airflow/dags/__pycache__/
 dbt/target/
 dbt/logs/
 transform/dbt/target/

@@ -8,3 +8,7 @@ data/**
 logs/**
 spark-warehouse
 *.duckdb
+airflow/logs
+airflow/config/simple_auth_manager_passwords.json.generated
+airflow/__pycache__
+airflow/dags/__pycache__

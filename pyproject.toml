@@ -35,6 +35,10 @@ kafka = [
 spark = [
     "pyspark==4.0.1",
 ]
+streaming = [
+    "psycopg[binary]==3.2.10",
+    "pyspark==4.0.1",
+]
 analytics = [
     "duckdb==1.4.1",
     "pyarrow==21.0.0",

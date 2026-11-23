@@ -186,3 +186,146 @@ docs/                     Architecture and operational documentation
 GCP credentials are not stored in the repository. GCS and BigQuery adapters use
 Application Default Credentials when instantiated; no cloud connection is
 created by local generation, validation, ingestion, or reporting.
+
+## Phase 2: PostgreSQL CDC Streaming
+
+Phase 2 adds PostgreSQL logical replication, Debezium PostgreSQL CDC, Kafka,
+and a separate PySpark Structured Streaming consumer. The local stack is
+optional; Phase 1 remains usable without Docker or Spark.
+
+### Verified Version Matrix
+
+| Component | Pin | Compatibility evidence |
+| --- | --- | --- |
+| PostgreSQL | 16.4 | Debezium 3.2 tested with PostgreSQL 12 through 17 and `pgoutput`. |
+| Kafka broker | Apache Kafka 4.0.1 | One-node KRaft configuration; replication factor 1. |
+| Kafka Connect / Debezium | `quay.io/debezium/connect:3.2` pinned by OCI digest in Compose; live connector reported **3.2.4.Final** | Debezium 3.2 supports Kafka Connect 3.1+; the live Debezium source metadata reported 3.2.4.Final. |
+| Spark | Apache Spark 4.0.1 | Requires Java 17 and is built for Scala 2.13. |
+| Spark Kafka connector | `org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1` | Exact artifact/version from Spark 4.0.1’s Structured Streaming Kafka guide. |
+
+Spark Kafka integration is deliberately not substituted with a Python Kafka
+consumer. The `streaming` extra pins PySpark 4.0.1 and psycopg 3.2.10 for
+host-side execution; the optional Compose `streaming` profile supplies Spark
+4.0.1 in a container so local use does not need the large PySpark wheel.
+
+Debezium PostgreSQL uses `pgoutput`, a stable replication slot and a
+pre-created publication. PostgreSQL schema history is not stored in a separate
+history topic for this connector; event schemas are carried in the JSON value
+converter envelope. The connector uses `snapshot.mode=initial`, includes
+schema-bearing values, preserves before/after/source/transaction fields, and
+routes table topics to `employee_changes`, `dependent_changes`,
+`policy_changes`, and `company_changes`. Delete events are followed by Kafka
+tombstones. The consumer keeps the delete operation as a Silver
+`record_status=deleted` state rather than treating the tombstone as the delete.
+
+### Data Flow And Recovery
+
+```text
+PostgreSQL WAL (logical, pgoutput)
+  -> Debezium PostgreSQL connector / Kafka Connect offsets
+  -> employee_changes, dependent_changes, policy_changes, company_changes
+  -> Spark Structured Streaming (Kafka source + durable checkpoint)
+       -> Bronze Parquet: untouched key/value envelope, schema, metadata, offsets
+       -> Kafka employee_dead_letter + Quarantine Parquet: malformed/schema errors
+       -> DuckDB event ledger: topic/partition/offset event ID dedupe
+       -> Silver employee_current: LSN, event timestamp, transaction order,
+          partition and offset guard against stale updates
+```
+
+Bronze stores the raw Kafka key and value (including the original Debezium
+envelope), topic, partition, offset, Kafka timestamp, schema, before/after,
+source metadata, transaction metadata, and Spark batch ID. A tombstone is stored
+as a Bronze row with `is_tombstone=true`. Spark’s checkpoint directory is
+`data/checkpoints/cdc_v2/employee-cdc`; keep it with the Kafka offsets when
+restarting the same query. DuckDB’s `cdc_event_ledger` prevents duplicate
+offsets from being applied twice. Silver upserts compare source LSN first,
+then source event time, transaction order, partition, and offset.
+
+### Local Runbook
+
+Start PostgreSQL, Kafka, topic initialization, and Debezium Connect:
+
+```zsh
+scripts/start_services.sh
+```
+
+The local PostgreSQL database is `streamlake_source`; the default local-only
+credentials are `streamlake` / `streamlake_local_only`. Override them in `.env`
+before first initialization if needed. The SQL bootstrap sets `wal_level=logical`,
+`max_wal_senders`, `max_replication_slots`, `REPLICA IDENTITY FULL`, and the
+`streamlake_publication` publication for companies, policies, employees, and
+dependents.
+
+Seed a small source dataset, register the connector, and check its state/topics:
+
+```zsh
+.venv/bin/python scripts/seed_postgres.py --employees 50 --seed 42
+scripts/register_connector.sh
+scripts/verify_kafka_topics.sh
+```
+
+Start the consumer independently from the database/connect services:
+
+```zsh
+scripts/start_spark_consumer.sh
+```
+
+`start_spark_consumer.sh` builds the optional Spark profile and starts the
+Structured Streaming query. For a host Spark installation, install
+`.[streaming]` and run the script with the same connector coordinate shown in
+the version table. Do not remove `data/checkpoints/cdc_v2/employee-cdc` during a
+normal restart.
+
+In another terminal, generate a real INSERT, UPDATE, and DELETE:
+
+```zsh
+scripts/insert_employee.sh EMP-CDC-0001
+scripts/update_employee.sh EMP-CDC-0001 cdc.updated@example.test 750000
+scripts/delete_employee.sh EMP-CDC-0001
+```
+
+Inspect the stream outputs and current employee state:
+
+```zsh
+.venv/bin/python scripts/inspect_cdc_data.py --limit 5
+```
+
+`data/bronze/cdc_v2/` is append-oriented and partitioned by Spark batch, event
+date, and source table. `data/silver/cdc_employee_current_v2.parquet` is a
+snapshot of DuckDB current state. Deletes remain there as rows with
+`record_status=deleted`. Invalid messages are written to
+`data/quarantine/cdc_v2/` and the `employee_dead_letter` topic. The `cdc_v2`
+paths preserve the first pre-decoder test run's local artifacts.
+
+### Phase 2 Verification
+
+The unit suite is infrastructure-independent:
+
+```zsh
+.venv/bin/python -m pytest
+.venv/bin/python -m pip check
+```
+
+The live Compose run completed PostgreSQL INSERT, UPDATE, and DELETE changes
+for all three demo employees. It recorded **96 unique valid CDC events** across
+the four captured tables. The employee topic included INSERT (`c`), UPDATE
+(`u`), and DELETE (`d`) operations; the corresponding Kafka tombstones (`t`)
+were retained as Bronze events. Deleted employees remained in Silver with
+`record_status=deleted`.
+
+Spark was restarted using its existing checkpoint. The replay did not create
+duplicate event IDs in the event ledger. Debezium source metadata in the
+captured event payload reported version **3.2.4.Final**.
+
+Malformed-message verification also completed against the live stream. A
+`not-json` value on `employee_changes` was retained in Bronze, counted as one
+rejected ledger event, written as one row under `data/quarantine/cdc_v2/`, and
+published to `employee_dead_letter` with its topic, partition, offset, raw
+payload, and parse error. This probe is an additional rejected event; after it,
+the local ledger contained 97 distinct IDs (96 valid CDC events plus the one
+malformed probe).
+
+The unit suite reports **23 passing tests**, covering CDC operations,
+deduplication, malformed messages, ordering, connectivity probing, and
+checkpoint behavior alongside the batch pipeline. `.venv/bin/python -m pip
+check` reported no broken requirements.

@@ -744,3 +744,29 @@ PYSPARK_SUBMIT_ARGS='--driver-memory 512m --conf spark.sql.shuffle.partitions=4 
 The GCP integration test stays skipped unless `RUN_GCP_INTEGRATION=1` and valid
 ADC, project, bucket, APIs, and IAM permissions are configured. Unit failure
 simulations use fake GCS/BigQuery/Kafka services and do not need cloud access.
+
+## Phase 7: Analytics and Business Reporting
+
+Run the 12 DuckDB business queries and verify KPI reconciliation against the
+current Gold marts:
+
+```zsh
+python scripts/run_phase7_analytics.py
+```
+
+The measured results are written to `analytics/sample_outputs.md`. Generate
+portable Power BI CSV snapshots after a successful dbt build:
+
+```zsh
+python scripts/export_powerbi_gold.py
+```
+
+The exports go to ignored `data/powerbi/`. Power BI Desktop is not available
+natively on macOS; use Power BI Desktop on Windows or publish/import the CSV
+datasets through Power BI Service, subject to tenant capabilities and licensing.
+The implementation provides a report specification, model dictionary,
+relationship notes, DAX starter measures, and import guidance in `analytics/`;
+it does not claim a `.pbix` report artifact exists. The current Gold layer has
+dependent aggregates but no dependent-level fact. A monthly quality rejection
+trend needs Phase 6 executions that have recorded operational metrics; without
+those observations, the report should show no history rather than fabricate it.

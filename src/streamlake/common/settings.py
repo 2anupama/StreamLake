@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     batch_chunk_size: int = Field(default=2_000, gt=0)
     source_system: str = "local"
 
+    storage_backend: Literal["local", "gcp"] = "local"
+    warehouse_backend: Literal["duckdb", "bigquery"] = "duckdb"
     gcp_project_id: str | None = None
+    gcp_region: str = "us-central1"
     gcs_bucket: str | None = None
-    bigquery_dataset: str | None = None
+    bigquery_dataset: str = "streamlake_silver"
+    google_application_credentials: Path | None = None

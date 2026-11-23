@@ -172,20 +172,135 @@ logs/                           Application log and JSONL ingestion audit
 tests/unit/                     Validation and layer behavior tests
 ```
 
-## Optional Cloud Adapters
+## Phase 5: GCP Storage And BigQuery
 
-Local runs use filesystem Parquet and DuckDB only. Install the optional GCP
-libraries before constructing the cloud adapters:
+Local remains the default and continues to use filesystem Parquet and DuckDB.
+The GCP adapters are created only when selected. Batch Parquet output uses the
+storage adapter; the warehouse module exposes the managed BigQuery datasets,
+table schemas, load, incremental MERGE, and query operations for cloud batch
+jobs. No cloud service is started or accessed by the default local workflow.
+
+Install the optional client libraries:
 
 ```zsh
 python -m pip install -e '.[gcp]'
 ```
 
-docker/                   Local service definitions and images
-docs/                     Architecture and operational documentation
-GCP credentials are not stored in the repository. GCS and BigQuery adapters use
-Application Default Credentials when instantiated; no cloud connection is
-created by local generation, validation, ingestion, or reporting.
+### Create a GCP project and resources
+
+Create or select your own project in the Google Cloud Console, enable billing
+for that project, and set its ID and a supported region. The commands below do
+not assume a project or bucket already exists:
+
+```zsh
+export GCP_PROJECT_ID="your-project-id"
+export GCP_REGION="us-central1"
+export GCS_BUCKET="your-globally-unique-streamlake-bucket"
+gcloud config set project "$GCP_PROJECT_ID"
+gcloud services enable storage.googleapis.com bigquery.googleapis.com --project "$GCP_PROJECT_ID"
+gcloud storage buckets create "gs://$GCS_BUCKET" \
+  --project="$GCP_PROJECT_ID" --location="$GCP_REGION" \
+  --uniform-bucket-level-access
+```
+
+The runtime identity needs `roles/storage.objectAdmin` on the bucket and
+`roles/bigquery.dataEditor` plus `roles/bigquery.jobUser` on the project. The
+identity that provisions datasets also needs `roles/bigquery.user` or equivalent
+dataset creation permission. Prefer user ADC for local development:
+
+```zsh
+gcloud auth application-default login
+gcloud auth application-default set-quota-project "$GCP_PROJECT_ID"
+```
+
+For a service account, set `GOOGLE_APPLICATION_CREDENTIALS` to a local key file
+path only when ADC is not available. Never commit the key; `.env` is ignored by
+Git. Workload identity or attached service accounts are preferred outside local
+development.
+
+### Select cloud backends
+
+Copy `.env.example` to `.env` and set:
+
+```dotenv
+STORAGE_BACKEND=gcp
+WAREHOUSE_BACKEND=bigquery
+GCP_PROJECT_ID=your-project-id
+GCP_REGION=us-central1
+GCS_BUCKET=your-globally-unique-streamlake-bucket
+BIGQUERY_DATASET=streamlake_silver
+GOOGLE_APPLICATION_CREDENTIALS=
+```
+
+The GCS layout uses date and batch partitions where applicable:
+
+```text
+gs://<bucket>/bronze/{employees,dependents,policies}/ingestion_date=YYYY-MM-DD/...
+gs://<bucket>/silver/{employees,dependents,policies}/ingestion_date=YYYY-MM-DD/...
+gs://<bucket>/gold/{dimensions,facts,marts}/...
+gs://<bucket>/{quarantine,checkpoints,audit}/...
+```
+
+The local batch pipeline creates the storage adapter from `STORAGE_BACKEND` and
+retains DuckDB for its transaction processing. BigQuery operations are available
+through `streamlake.warehouse.bigquery.BigQueryWarehouse`; create datasets and
+managed Bronze/Silver/Gold/Audit tables on demand:
+
+```python
+from streamlake.common.settings import Settings
+from streamlake.warehouse import create_warehouse
+
+settings = Settings()
+warehouse = create_warehouse(settings)  # BigQueryWarehouse when configured
+warehouse.ensure_model_tables()
+warehouse.load_file(
+    "gs://your-bucket/bronze/employees/ingestion_date=2026-01-01/part.parquet",
+    "streamlake_bronze", "raw_employees", file_format="PARQUET",
+)
+```
+
+`load_file` supports local CSV/Parquet and GCS URI inputs. `load_incremental`
+loads a bounded file to a staging table and runs a key-based BigQuery `MERGE`.
+Use `query` with BigQuery query parameters for values; identifiers are validated
+and are not interpolated as values. Jobs are awaited and return job ID, state,
+row count, and errors; `get_job` can inspect a known job ID. BigQuery tables are
+date-partitioned and clustered where the model has an event/ingestion date and
+high-use keys.
+
+Example analytical query using the SDK:
+
+```python
+from google.cloud import bigquery
+from streamlake.common.settings import Settings
+from streamlake.warehouse import create_warehouse
+
+warehouse = create_warehouse(Settings())
+rows = warehouse.query(
+    "SELECT company_id, employee_count FROM `your-project-id.streamlake_gold.company_employee_summary` WHERE as_of_date >= @cutoff",
+    [bigquery.ScalarQueryParameter("cutoff", "DATE", "2026-01-01")],
+)
+```
+
+### Cost and cleanup
+
+GCS storage, operations, and network egress can incur charges. BigQuery storage,
+load jobs, and bytes scanned by queries can incur charges. Use a development
+bucket, bounded loads, date filters on partitioned tables, and dry-run/query
+cost checks. No always-running cloud compute is required. Inspect resources and
+remove only the resources created for this project when finished:
+
+```zsh
+gcloud storage rm --recursive "gs://$GCS_BUCKET/**"
+gcloud storage buckets delete "gs://$GCS_BUCKET"
+for dataset in streamlake_bronze streamlake_silver streamlake_gold streamlake_audit; do
+  bq --project_id="$GCP_PROJECT_ID" rm -r -f "$dataset"
+done
+```
+
+Cloud integration tests are opt-in and require real ADC, project APIs, IAM
+permissions, and a test bucket/project. Unit tests use SDK fakes and run without
+GCP authentication. No authenticated GCP integration test has been run, so this
+documentation and the mocked adapter tests do not claim live cloud verification.
 
 ## Phase 2: PostgreSQL CDC Streaming
 

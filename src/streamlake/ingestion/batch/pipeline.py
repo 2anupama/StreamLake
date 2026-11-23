@@ -26,7 +26,7 @@ from streamlake.ingestion.batch.schemas import (
     infer_source_type,
 )
 from streamlake.ingestion.batch.validation import validate_chunk
-from streamlake.storage.adapters import LocalParquetStorage
+from streamlake.storage.adapters import create_storage_adapter
 
 logger = logging.getLogger(__name__)
 METADATA_COLUMNS = (
@@ -71,7 +71,7 @@ class BatchPipeline:
         self.data_root = Path(self.settings.data_root)
         self.incoming_dir = self.data_root / "incoming"
         self.database_path = Path(self.settings.duckdb_path)
-        self.storage = LocalParquetStorage(self.data_root)
+        self.storage = create_storage_adapter(self.settings)
         self.audit_path = Path(self.settings.ingestion_audit_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_database()

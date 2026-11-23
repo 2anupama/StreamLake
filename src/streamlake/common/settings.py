@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     cdc_checkpoint_path: Path = Path("data/checkpoints/cdc_v2")
     cdc_duckdb_path: Path = Path("data/streamlake_cdc_v2.duckdb")
     cdc_max_offsets_per_trigger: int = Field(default=1_000, gt=0)
+    cdc_starting_offsets: str = "earliest"
+    cdc_query_name: str = "employee-cdc"
     data_root: Path = Path("data")
     duckdb_path: Path = Path("data/streamlake.duckdb")
     ingestion_audit_path: Path = Path("logs/ingestion_audit.jsonl")
@@ -56,3 +58,11 @@ class Settings(BaseSettings):
     gcs_bucket: str | None = None
     bigquery_dataset: str = "streamlake_silver"
     google_application_credentials: Path | None = None
+
+    smtp_host: str | None = None
+    smtp_port: int = Field(default=587, gt=0, le=65535)
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_from_email: str | None = None
+    alert_to_email: str | None = None
+    smtp_use_tls: bool = True

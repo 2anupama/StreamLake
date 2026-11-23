@@ -2,6 +2,7 @@ FROM apache/spark:4.0.1-scala2.13-java17-python3-ubuntu@sha256:acfe7e06e95dd13aa
 
 USER root
 RUN python3 -m pip install --no-cache-dir \
+	confluent-kafka==2.11.1 \
 	duckdb==1.4.1 \
 	pydantic-settings==2.10.1 \
 	python-dotenv==1.1.1

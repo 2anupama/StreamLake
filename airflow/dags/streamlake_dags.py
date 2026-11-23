@@ -16,6 +16,7 @@ from streamlake.orchestration.airflow_tasks import (
     ingest_candidates,
     run_dbt_transformation,
     run_spark_transformations,
+    retry_notification_callback,
     validate_candidates,
     verify_bronze,
     verify_data_quality,
@@ -30,6 +31,7 @@ DEFAULT_ARGS = {
     "retry_delay": timedelta(minutes=1),
     "execution_timeout": timedelta(hours=2),
     "on_failure_callback": failure_notification_callback,
+    "on_retry_callback": retry_notification_callback,
 }
 COMMON_DAG_ARGS = {
     "start_date": pendulum.datetime(2025, 1, 1, tz="UTC"),

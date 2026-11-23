@@ -19,6 +19,13 @@ import duckdb
 from streamlake.common.settings import Settings
 from streamlake.ingestion.batch.pipeline import BatchPipeline
 from streamlake.ingestion.batch.schemas import SourceType, infer_source_type
+from streamlake.monitoring.alerts import send_alert
+from streamlake.monitoring.reliability import (
+    ensure_reliability_tables,
+    record_batch_audit,
+    record_lineage,
+    record_metric,
+)
 
 logger = logging.getLogger("streamlake.airflow")
 PROJECT_ROOT = Path(os.environ.get("STREAMLAKE_ROOT", Path(__file__).resolve().parents[3])).resolve()
@@ -73,19 +80,22 @@ def _historical_source_names(
     batch_id: str | None,
     start_date: str | None,
     end_date: str | None,
-) -> list[str] | None:
+) -> dict[str, set[str]] | None:
     if batch_id:
         connection = pipeline._connect()
         try:
             rows = connection.execute(
-                "SELECT DISTINCT source_file FROM batch_history WHERE batch_id = ? OR duplicate_of = ?",
+                "SELECT source_file, file_fingerprint FROM batch_history WHERE batch_id = ? OR duplicate_of = ?",
                 [batch_id, batch_id],
             ).fetchall()
         finally:
             connection.close()
         if not rows:
             raise ValueError(f"Unknown historical batch_id: {batch_id}")
-        return [row[0] for row in rows]
+        selected: dict[str, set[str]] = {}
+        for source_file, fingerprint in rows:
+            selected.setdefault(source_file, set()).add(fingerprint)
+        return selected
     if not start_date and not end_date:
         return None
 
@@ -96,7 +106,7 @@ def _historical_source_names(
     connection = pipeline._connect()
     try:
         rows = connection.execute(
-            """SELECT DISTINCT source_file FROM batch_history
+            """SELECT DISTINCT source_file, file_fingerprint FROM batch_history
                WHERE try_cast(started_at AS TIMESTAMP)::DATE >= ?
                  AND try_cast(started_at AS TIMESTAMP)::DATE <= ?
                  AND status IN ('completed', 'empty', 'skipped_duplicate')""",
@@ -104,7 +114,10 @@ def _historical_source_names(
         ).fetchall()
     finally:
         connection.close()
-    return [row[0] for row in rows]
+    selected = {}
+    for source_file, fingerprint in rows:
+        selected.setdefault(source_file, set()).add(fingerprint)
+    return selected
 
 
 def discover_candidates(params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -142,6 +155,11 @@ def discover_candidates(params: dict[str, Any] | None = None) -> dict[str, Any]:
             logger.info("Ignoring unrecognized source file %s", path.name)
             continue
         fingerprint = pipeline._fingerprint(path, source_type, pipeline.settings.source_system)
+        expected_fingerprints = (requested_names or {}).get(path.name)
+        if historical_request and expected_fingerprints and fingerprint not in expected_fingerprints:
+            raise ValueError(
+                f"Historical source {path.name!r} has changed since the selected batch; restore the archived file"
+            )
         candidates.append(
             {
                 "relative_path": str(path.relative_to(input_dir)),
@@ -227,6 +245,7 @@ def ingest_candidates(discovery: dict[str, Any], batch_info: dict[str, str]) -> 
             input_dir / item["relative_path"],
             source_type=item["source_type"],
             source_system=pipeline.settings.source_system,
+            reprocess=bool(discovery.get("backfill")),
         )
         results.append(result.as_dict())
     totals = {
@@ -293,6 +312,9 @@ def verify_data_quality(_silver_result: dict[str, Any] | None = None) -> dict[st
     if not path.is_file():
         raise FileNotFoundError(f"Quality report not found: {path}")
     report = json.loads(path.read_text(encoding="utf-8"))
+    rejected_records = int(report.get("employee_rejected_rows", 0)) + int(report.get("dependent_rejected_rows", 0))
+    _record_local_metric("streamlake_data_quality", "data_quality_rejected_records", rejected_records,
+                         {"report": str(path)})
     reconciliation_fields = (
         "source_target_reconciled",
         "employee_source_target_reconciled",
@@ -300,11 +322,15 @@ def verify_data_quality(_silver_result: dict[str, Any] | None = None) -> dict[st
     )
     failed = [name for name in reconciliation_fields if report.get(name) is not True]
     if failed:
+        _record_local_metric("streamlake_data_quality", "data_quality_failures", len(failed),
+                             {"failed_checks": failed})
+        send_alert("StreamLake data quality reconciliation failed", ", ".join(failed))
         raise ValueError(f"Data quality reconciliation failed: {failed}")
     return {
         "quality_report": report,
         "records_rejected": int(report.get("employee_rejected_rows", 0)) + int(report.get("dependent_rejected_rows", 0)),
         "employee_rows": int(report.get("accepted_rows", 0)),
+        "dependent_rows": int(report.get("dependent_accepted_rows", 0)),
     }
 
 
@@ -333,7 +359,7 @@ def run_dbt_transformation(_gold_result: dict[str, Any] | None = None) -> dict[s
         cwd=PROJECT_ROOT / "transform" / "dbt",
         env=env,
     )
-    return {"dbt_returncode": result.returncode, "target": "local"}
+    return {"dbt_returncode": result.returncode, "target": "local", "gold": _gold_result or {}}
 
 
 def write_audit_report(
@@ -376,6 +402,47 @@ def write_audit_report(
     target = PROJECT_ROOT / "data" / "airflow" / "audit" / f"{batch_info['batch_id']}.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(report, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    try:
+        connection = duckdb.connect(str(PROJECT_ROOT / "data" / "streamlake.duckdb"))
+        try:
+            ensure_reliability_tables(connection)
+            record_batch_audit(
+                connection, execution_id=f"airflow:{dag_id}:{report['airflow_run_id'] or batch_info['batch_id']}",
+                batch_id=batch_info["batch_id"], source_name=discovery.get("input_dir", "data/incoming"),
+                start_time=started, end_time=now, status="completed",
+                records_read=int(ingestion.get("rows_ingested", 0)),
+                records_written=int(ingestion.get("rows_loaded", 0)),
+                records_rejected=int(quality.get("records_rejected", 0)), pipeline_name=dag_id,
+            )
+            record_metric(connection, dag_id, "data_quality_rejected_records",
+                          int(quality.get("records_rejected", 0)), {"batch_id": batch_info["batch_id"]})
+            lineage_items = [
+                ("airflow_bronze_load", "bronze", int(ingestion.get("rows_ingested", 0)),
+                 int(ingestion.get("rows_ingested", 0)), 0),
+                ("pyspark_bronze_to_silver", "silver.employees",
+                 int(ingestion.get("rows_processed", 0)), int(quality.get("employee_rows", 0)),
+                 int(quality.get("records_rejected", 0))),
+                ("pyspark_bronze_to_silver", "silver.dependents",
+                 int(ingestion.get("rows_processed", 0)), int(quality.get("dependent_rows", 0)),
+                 int(quality.get("records_rejected", 0))),
+            ]
+            gold_counts = ((dbt_result.get("gold") or {}).get("mart_counts") or {})
+            lineage_items.extend(
+                ("dbt_transformation", f"gold.{table}", None, int(row_count), 0)
+                for table, row_count in gold_counts.items()
+            )
+            for transformation, target, read_count, write_count, reject_count in lineage_items:
+                record_lineage(
+                    connection, execution_id=f"airflow:{dag_id}:{report['airflow_run_id'] or batch_info['batch_id']}",
+                    batch_id=batch_info["batch_id"], source_system="streamlake",
+                    source_name=discovery.get("input_dir", "data/incoming"),
+                    transformation_name=transformation, target_table=target,
+                    records_read=read_count, records_written=write_count, records_rejected=reject_count,
+                )
+        finally:
+            connection.close()
+    except Exception:
+        logger.exception("Could not persist Airflow audit metrics in DuckDB")
     logger.info("Airflow audit report written to %s", target)
     return {"audit_path": str(target), "report": report}
 
@@ -408,15 +475,20 @@ def daily_reconciliation() -> dict[str, Any]:
 
 
 def failure_notification_callback(context: dict[str, Any]) -> None:
-    """Log task failure and optionally delegate to a configured module:function callback."""
+    """Persist and alert on the actual task failure, then run an optional callback."""
     task_instance = context.get("task_instance")
+    dag_id = getattr(getattr(task_instance, "dag", None), "dag_id", "unknown")
+    task_id = getattr(task_instance, "task_id", "unknown")
+    run_id = getattr(task_instance, "run_id", "unknown")
     message = {
-        "dag_id": getattr(getattr(task_instance, "dag", None), "dag_id", "unknown"),
-        "task_id": getattr(task_instance, "task_id", "unknown"),
-        "run_id": getattr(task_instance, "run_id", "unknown"),
+        "dag_id": dag_id,
+        "task_id": task_id,
+        "run_id": run_id,
         "exception": str(context.get("exception", "unknown")),
     }
     logger.error("Airflow task failed: %s", json.dumps(message, sort_keys=True))
+    send_alert(f"StreamLake Airflow failure: {dag_id}.{task_id}", json.dumps(message, sort_keys=True))
+    _record_airflow_event(context, "airflow_task_failures", "failed")
     callback_spec = os.environ.get("STREAMLAKE_AIRFLOW_FAILURE_CALLBACK", "").strip()
     if not callback_spec:
         return
@@ -429,6 +501,60 @@ def failure_notification_callback(context: dict[str, Any]) -> None:
         callback(context)
     except Exception:
         logger.exception("Configured Airflow failure callback failed")
+
+
+def retry_notification_callback(context: dict[str, Any]) -> None:
+    """Record each Airflow retry attempt from the task instance context."""
+    task_instance = context.get("task_instance")
+    logger.warning("Airflow task retry: dag=%s task=%s run=%s try=%s",
+                   getattr(getattr(task_instance, "dag", None), "dag_id", "unknown"),
+                   getattr(task_instance, "task_id", "unknown"),
+                   getattr(task_instance, "run_id", "unknown"),
+                   getattr(task_instance, "try_number", 0))
+    _record_airflow_event(context, "airflow_task_retries", "retrying")
+
+
+def _record_airflow_event(context: dict[str, Any], metric_name: str, status: str) -> None:
+    task_instance = context.get("task_instance")
+    dag_id = getattr(getattr(task_instance, "dag", None), "dag_id", "unknown")
+    task_id = getattr(task_instance, "task_id", "unknown")
+    run_id = getattr(task_instance, "run_id", "unknown")
+    now = datetime.now(timezone.utc)
+    start = getattr(task_instance, "start_date", None) or now
+    end = getattr(task_instance, "end_date", None)
+    execution_id = f"airflow:{dag_id}:{run_id}:{task_id}:{getattr(task_instance, 'try_number', 0)}"
+    try:
+        database = PROJECT_ROOT / "data" / "streamlake.duckdb"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        connection = duckdb.connect(str(database))
+        try:
+            ensure_reliability_tables(connection)
+            record_batch_audit(connection, execution_id=execution_id, batch_id=str(run_id),
+                               source_name=f"{dag_id}.{task_id}", start_time=start,
+                               end_time=end, status=status,
+                               error_message=str(context.get("exception", "")) or None,
+                               pipeline_name=str(dag_id))
+            record_metric(connection, str(dag_id), metric_name, 1,
+                          {"task_id": task_id, "run_id": run_id,
+                           "try_number": getattr(task_instance, "try_number", 0)})
+        finally:
+            connection.close()
+    except Exception:
+        logger.exception("Could not persist Airflow reliability event")
+
+
+def _record_local_metric(pipeline_name: str, metric_name: str, value: float, dimensions: dict[str, Any]) -> None:
+    try:
+        database = PROJECT_ROOT / "data" / "streamlake.duckdb"
+        database.parent.mkdir(parents=True, exist_ok=True)
+        connection = duckdb.connect(str(database))
+        try:
+            ensure_reliability_tables(connection)
+            record_metric(connection, pipeline_name, metric_name, value, dimensions)
+        finally:
+            connection.close()
+    except Exception:
+        logger.exception("Could not persist metric %s", metric_name)
 
 
 def _parquet_count(path: Path) -> int:

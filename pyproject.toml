@@ -36,6 +36,7 @@ spark = [
     "pyspark==4.0.1",
 ]
 streaming = [
+    "confluent-kafka==2.11.1",
     "psycopg[binary]==3.2.10",
     "pyspark==4.0.1",
 ]

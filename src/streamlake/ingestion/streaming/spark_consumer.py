@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,14 @@ from typing import Any
 
 from streamlake.common.settings import Settings
 from streamlake.ingestion.streaming.cdc import checkpoint_location, parse_cdc_message
+from streamlake.monitoring.kafka import collect_partition_lag
+from streamlake.monitoring.reliability import (
+    ensure_reliability_tables,
+    record_batch_audit,
+    record_debezium_schema,
+    record_lineage,
+    record_metric,
+)
 
 logger = logging.getLogger("streamlake.streaming")
 KAFKA_CONNECTOR_COORDINATE = "org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1"
@@ -90,7 +99,7 @@ def build_stream(spark, settings: Settings):
         spark.readStream.format("kafka")
         .option("kafka.bootstrap.servers", settings.kafka_bootstrap_servers)
         .option("subscribe", topics)
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", settings.cdc_starting_offsets)
         .option("failOnDataLoss", "true")
         .option("maxOffsetsPerTrigger", settings.cdc_max_offsets_per_trigger)
         .load()
@@ -123,7 +132,11 @@ def start_consumer(settings: Settings | None = None, spark=None) -> None:
             logger.info("Spark batch %s is empty", spark_batch_id)
             return
 
-        batch_token = f"spark-{spark_batch_id:020d}"
+        query_name = settings.cdc_query_name.strip()
+        if not query_name or "/" in query_name or ".." in query_name:
+            raise ValueError("CDC_QUERY_NAME must be a simple non-empty name")
+        batch_token = (f"spark-{spark_batch_id:020d}" if query_name == "employee-cdc"
+                       else f"{query_name}-spark-{spark_batch_id:020d}")
         now = datetime.now(timezone.utc).isoformat()
         from pyspark.sql import functions as F
 
@@ -140,6 +153,15 @@ def start_consumer(settings: Settings | None = None, spark=None) -> None:
             )
             .withColumn("event_date", F.coalesce("event_date", F.current_date()))
         )
+        schema_conflicts = _observe_stream_schemas(enriched, Path(settings.cdc_duckdb_path))
+        for source_table, fields in schema_conflicts.items():
+            enriched = enriched.withColumn(
+                "error_reason",
+                F.when(
+                    (F.col("source_table") == source_table) & F.col("error_reason").isNull(),
+                    F.lit(f"Incompatible Debezium schema type change: {fields}"),
+                ).otherwise(F.col("error_reason")),
+            )
         bronze_batch_path = Path(settings.cdc_bronze_path) / f"batch_id={batch_token}"
         stage_batch_path = Path(settings.cdc_staging_path) / f"batch_id={batch_token}"
 
@@ -159,9 +181,11 @@ def start_consumer(settings: Settings | None = None, spark=None) -> None:
                         "topic",
                         "partition",
                         "offset",
+                        F.col("topic").alias("source_topic"),
                         "raw_payload",
-                        "error_reason",
+                        F.col("error_reason").alias("error_message"),
                         "processing_timestamp",
+                        F.current_timestamp().alias("failure_timestamp"),
                     )
                 ).alias("value"),
             )
@@ -172,7 +196,12 @@ def start_consumer(settings: Settings | None = None, spark=None) -> None:
                 .save()
             )
 
-        counts = _apply_duckdb_batch(Path(settings.cdc_duckdb_path), stage_batch_path, settings)
+        try:
+            counts = _apply_duckdb_batch(Path(settings.cdc_duckdb_path), stage_batch_path, settings,
+                                         kafka_bootstrap_servers=settings.kafka_bootstrap_servers)
+        except Exception:
+            logger.exception("CDC batch %s failed and will be retried from its checkpoint", batch_token)
+            raise
         logger.info(
             "Spark batch %s processed; input=%s deduplicated=%s applied=%s rejected=%s",
             batch_token,
@@ -184,7 +213,7 @@ def start_consumer(settings: Settings | None = None, spark=None) -> None:
 
     query = (
         parsed_stream.writeStream.queryName("streamlake-employee-cdc")
-        .option("checkpointLocation", checkpoint_location(str(settings.cdc_checkpoint_path)))
+        .option("checkpointLocation", checkpoint_location(str(settings.cdc_checkpoint_path), settings.cdc_query_name))
         .foreachBatch(process_batch)
         .start()
     )
@@ -196,10 +225,13 @@ def start_consumer(settings: Settings | None = None, spark=None) -> None:
     query.awaitTermination()
 
 
-def _apply_duckdb_batch(database_path: Path, stage_path: Path, settings: Settings) -> dict[str, int]:
+def _apply_duckdb_batch(database_path: Path, stage_path: Path, settings: Settings,
+                        kafka_bootstrap_servers: str | None = None) -> dict[str, Any]:
     """Deduplicate and upsert a Spark-written Parquet microbatch transactionally."""
     import duckdb
 
+    batch_started_at = datetime.now(timezone.utc)
+    monotonic_start = time.monotonic()
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = duckdb.connect(str(database_path))
     stage_glob = str(stage_path / "**" / "*.parquet").replace("'", "''")
@@ -207,6 +239,7 @@ def _apply_duckdb_batch(database_path: Path, stage_path: Path, settings: Setting
     silver_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_silver_path = silver_path.with_name(f".{silver_path.name}-{uuid.uuid4().hex}.tmp.parquet")
     try:
+        ensure_reliability_tables(connection)
         connection.execute(
             """CREATE TABLE IF NOT EXISTS cdc_event_ledger (
                 event_id VARCHAR PRIMARY KEY,
@@ -252,6 +285,20 @@ def _apply_duckdb_batch(database_path: Path, stage_path: Path, settings: Setting
                LEFT JOIN cdc_event_ledger AS ledger USING (event_id)
                WHERE ledger.event_id IS NULL"""
         )
+        cdc_schemas = connection.execute(
+            "SELECT DISTINCT source_table, schema_json FROM cdc_new "
+            "WHERE source_table IS NOT NULL AND schema_json IS NOT NULL"
+        ).fetchall()
+        incompatible_tables = []
+        for source_table, schema_json in cdc_schemas:
+            observed = record_debezium_schema(connection, source_table, schema_json)
+            if observed and observed["incompatible_columns"]:
+                incompatible_tables.append((source_table, ", ".join(observed["incompatible_columns"])))
+        for source_table, fields in incompatible_tables:
+            connection.execute(
+                "UPDATE cdc_new SET error_reason = coalesce(error_reason, ?) WHERE source_table = ?",
+                [f"Incompatible Debezium schema type change: {fields}", source_table],
+            )
         deduplicated = connection.execute("SELECT count(*) FROM cdc_new").fetchone()[0]
         connection.execute(
             """INSERT INTO cdc_event_ledger
@@ -334,8 +381,6 @@ def _apply_duckdb_batch(database_path: Path, stage_path: Path, settings: Setting
                       AND (excluded.partition_id, excluded.kafka_offset) >
                           (employee_current.partition_id, employee_current.kafka_offset))"""
         )
-        connection.execute("COMMIT")
-
         rejected = connection.execute(
             "SELECT count(*) FROM cdc_new WHERE error_reason IS NOT NULL"
         ).fetchone()[0]
@@ -345,10 +390,63 @@ def _apply_duckdb_batch(database_path: Path, stage_path: Path, settings: Setting
                                  ON current.employee_id = batch.employee_id
                                 AND current.last_event_id = batch.event_id"""
         ).fetchone()[0]
+        latency = connection.execute(
+            """SELECT avg(greatest(0, kafka_timestamp_ms - event_timestamp_ms) / 1000.0)
+               FROM cdc_stage WHERE kafka_timestamp_ms IS NOT NULL AND event_timestamp_ms IS NOT NULL"""
+        ).fetchone()[0]
+        elapsed = time.monotonic() - monotonic_start
+        finished_at = datetime.now(timezone.utc)
+        record_batch_audit(
+            connection, execution_id=str(Path(stage_path).name.removeprefix("batch_id=")),
+            batch_id=str(Path(stage_path).name.removeprefix("batch_id=")), source_name="Kafka CDC",
+            start_time=batch_started_at, end_time=finished_at, status="completed",
+            records_read=int(input_count), records_written=int(applied), records_rejected=int(rejected),
+            pipeline_name="streamlake_cdc_streaming",
+        )
+        cdc_batch_id = str(Path(stage_path).name.removeprefix("batch_id="))
+        topic_counts = connection.execute(
+            "SELECT topic, count(*) FROM cdc_stage GROUP BY topic"
+        ).fetchall()
+        for topic, topic_count in topic_counts:
+            record_lineage(
+                connection, execution_id=cdc_batch_id, batch_id=cdc_batch_id,
+                source_system="debezium", source_name=topic,
+                transformation_name="parse_and_persist_cdc", target_table="bronze.cdc_events",
+                records_read=int(topic_count), records_written=int(topic_count),
+            )
+        employee_inputs = int(connection.execute(
+            "SELECT count(*) FROM cdc_new WHERE source_table='employees'"
+        ).fetchone()[0])
+        if employee_inputs:
+            record_lineage(
+                connection, execution_id=cdc_batch_id, batch_id=cdc_batch_id,
+                source_system="debezium", source_name="employee_changes",
+                transformation_name="deduplicate_and_merge_cdc", target_table="silver.employee_current",
+                records_read=employee_inputs, records_written=int(applied), records_rejected=int(rejected),
+            )
+        for metric, value in (("records_ingested", input_count), ("records_deduplicated", input_count - deduplicated),
+                              ("records_processed", applied), ("records_rejected", rejected),
+                              ("execution_seconds", elapsed)):
+            record_metric(connection, "streamlake_cdc_streaming", metric, value,
+                          {"batch_id": Path(stage_path).name.removeprefix("batch_id=")})
+        if latency is not None:
+            record_metric(connection, "streamlake_cdc_streaming", "event_latency_seconds", float(latency),
+                          {"measurement": "average_event_to_kafka_timestamp"})
+        if kafka_bootstrap_servers:
+            offsets = connection.execute(
+                'SELECT topic, "partition", max("offset") FROM cdc_stage GROUP BY topic, "partition"'
+            ).fetchall()
+            try:
+                for lag in collect_partition_lag(kafka_bootstrap_servers, offsets):
+                    record_metric(connection, "streamlake_cdc_streaming", "kafka_consumer_lag_records",
+                                  lag["lag_records"], {"topic": lag["topic"], "partition": lag["partition"]})
+            except Exception:
+                logger.warning("Kafka lag collection failed; no lag value was recorded", exc_info=True)
         escaped_path = str(temporary_silver_path).replace("'", "''")
         connection.execute(
             f"COPY (SELECT * FROM employee_current) TO '{escaped_path}' (FORMAT PARQUET, COMPRESSION ZSTD)"
         )
+        connection.execute("COMMIT")
         os.replace(temporary_silver_path, silver_path)
         return {
             "input": int(input_count),
@@ -365,6 +463,29 @@ def _apply_duckdb_batch(database_path: Path, stage_path: Path, settings: Setting
         raise
     finally:
         connection.close()
+
+
+def _observe_stream_schemas(enriched, database_path: Path) -> dict[str, str]:
+    """Persist observed Debezium schemas and return incompatible table/field changes."""
+    import duckdb
+    from pyspark.sql import functions as F
+
+    schemas = enriched.select("source_table", "schema_json").where(
+        F.col("source_table").isNotNull() & F.col("schema_json").isNotNull()
+    ).distinct().collect()
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    connection = duckdb.connect(str(database_path))
+    conflicts: dict[str, str] = {}
+    try:
+        ensure_reliability_tables(connection)
+        for row in schemas:
+            table = row["source_table"]
+            observed = record_debezium_schema(connection, table, row["schema_json"])
+            if observed and observed["incompatible_columns"]:
+                conflicts[table] = ", ".join(observed["incompatible_columns"])
+    finally:
+        connection.close()
+    return conflicts
 
 
 def main() -> None:

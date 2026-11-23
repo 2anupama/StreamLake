@@ -116,6 +116,8 @@ services:
       CDC_QUARANTINE_PATH: /opt/streamlake/data/quarantine/cdc_v2
       CDC_CHECKPOINT_PATH: /opt/streamlake/data/checkpoints/cdc_v2
       CDC_DUCKDB_PATH: /opt/streamlake/data/streamlake_cdc_v2.duckdb
+      CDC_STARTING_OFFSETS: ${CDC_STARTING_OFFSETS:-earliest}
+      CDC_QUERY_NAME: ${CDC_QUERY_NAME:-employee-cdc}
     volumes:
       - .:/opt/streamlake
     command:

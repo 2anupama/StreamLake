@@ -26,6 +26,14 @@ from streamlake.ingestion.batch.schemas import (
     infer_source_type,
 )
 from streamlake.ingestion.batch.validation import validate_chunk
+from streamlake.monitoring.reliability import (
+    ensure_reliability_tables,
+    monitoring_snapshot,
+    observe_schema,
+    record_batch_audit,
+    record_lineage,
+    record_metric,
+)
 from streamlake.storage.adapters import create_storage_adapter
 
 logger = logging.getLogger(__name__)
@@ -81,6 +89,7 @@ class BatchPipeline:
         path: Path,
         source_type: str | SourceType | None = None,
         source_system: str | None = None,
+        reprocess: bool = False,
     ) -> IngestionResult:
         """Ingest one file, returning zero loaded rows for an idempotent replay."""
         path = Path(path)
@@ -102,7 +111,7 @@ class BatchPipeline:
                        ORDER BY started_at DESC LIMIT 1""",
                     [fingerprint],
                 ).fetchone()
-                if previous:
+                if previous and not reprocess:
                     replay_batch_id = f"batch_{uuid.uuid4().hex}"
                     replay_started_at = self._now()
                     counters = {"ingested": 0, "processed": 0, "rejected": 0, "loaded": 0}
@@ -130,6 +139,8 @@ class BatchPipeline:
                         skipped=True,
                         duplicate_of=previous[0],
                     )
+                    record_metric(connection, "streamlake_batch_ingestion", "duplicate_batches", 1,
+                                  {"duplicate_of": previous[0], "source_file": path.name})
                     self._write_audit(result, resolved_source_system, replay_started_at)
                     return result
 
@@ -156,9 +167,31 @@ class BatchPipeline:
 
                     missing_columns = set(REQUIRED_COLUMNS[resolved_source_type]) - set(columns)
                     reserved_conflicts = RESERVED_COLUMNS & set(columns)
+                    schema_types = self._infer_schema_types(path, columns)
+                    schema_observation = observe_schema(
+                        connection, resolved_source_type.value, columns, schema_types,
+                        REQUIRED_COLUMNS[resolved_source_type],
+                    )
+                    if schema_observation["added"]:
+                        record_metric(connection, "streamlake_batch_ingestion", "schema_columns_added",
+                                      len(schema_observation["added"]), {"source_type": resolved_source_type.value})
+                    if schema_observation["removed"]:
+                        record_metric(connection, "streamlake_batch_ingestion", "schema_columns_removed",
+                                      len(schema_observation["removed"]), {"source_type": resolved_source_type.value})
                     if missing_columns:
+                        metadata = {
+                            "ingestion_timestamp": self._now(), "batch_id": batch_id,
+                            "source_file": path.name, "source_system": resolved_source_system,
+                            "source_type": resolved_source_type.value, "ingestion_status": "schema_incompatible",
+                        }
+                        message = f"Missing required columns: {', '.join(sorted(missing_columns))}"
+                        self._write_quarantine(
+                            [{"original_record": json.dumps({"columns": columns}), "error_reason": message}],
+                            metadata, ingestion_date, 0,
+                        )
+                        counters["rejected"] += 1
                         raise ValueError(
-                            f"Missing required columns: {', '.join(sorted(missing_columns))}"
+                            message
                         )
                     if reserved_conflicts:
                         raise ValueError(
@@ -192,6 +225,12 @@ class BatchPipeline:
                                 batch_id,
                                 part_number,
                             )
+                            record_lineage(
+                                connection, execution_id=batch_id, batch_id=batch_id,
+                                source_system=resolved_source_system, source_name=path.name,
+                                transformation_name="raw_ingestion", target_table="bronze",
+                                records_read=len(chunk.frame), records_written=len(bronze),
+                            )
                             part_number += 1
 
                             validation = validate_chunk(
@@ -201,20 +240,33 @@ class BatchPipeline:
                                 active_employee_ids=active_employee_ids,
                                 existing_dependent_ids=dependent_ids,
                                 seen_ids=seen_ids,
+                                allow_existing_ids=all_employee_ids if reprocess else None,
+                                allow_existing_dependent_ids=dependent_ids if reprocess else None,
                             )
-                            counters["processed"] += len(validation.accepted)
-                            counters["rejected"] += len(validation.rejected)
-                            if validation.accepted:
+                            accepted_rows = validation.accepted
+                            rejected_rows = validation.rejected
+                            incompatible_types = schema_observation["incompatible_columns"]
+                            if incompatible_types and accepted_rows:
+                                rejected_rows = rejected_rows + [
+                                    {**row, "original_record": json.dumps(row, default=str),
+                                     "error_reason": "Incompatible schema type change: " + ", ".join(incompatible_types)}
+                                    for row in accepted_rows
+                                ]
+                                accepted_rows = []
+                            counters["processed"] += len(accepted_rows)
+                            counters["rejected"] += len(rejected_rows)
+                            if accepted_rows:
                                 accepted = self._prepare_accepted(
                                     connection,
-                                    validation.accepted,
+                                    accepted_rows,
                                     resolved_source_type,
                                     metadata,
                                     ingestion_date,
                                     part_number,
                                 )
-                                counters["loaded"] += len(accepted)
-                                self._apply_records(connection, accepted, resolved_source_type)
+                                counters["loaded"] += self._apply_records(
+                                    connection, accepted, resolved_source_type
+                                )
                                 if resolved_source_type is SourceType.ADDITIONS:
                                     for record in accepted:
                                         employee_id = str(record["employee_id"])
@@ -239,14 +291,26 @@ class BatchPipeline:
                                     batch_id,
                                     part_number,
                                 )
+                                record_lineage(
+                                    connection, execution_id=batch_id, batch_id=batch_id,
+                                    source_system=resolved_source_system, source_name=path.name,
+                                    transformation_name="validate_and_normalize", target_table="silver_events",
+                                    records_read=len(accepted_rows), records_written=len(accepted),
+                                )
                                 part_number += 1
 
-                            if validation.rejected:
+                            if rejected_rows:
                                 self._write_quarantine(
-                                    validation.rejected,
+                                    rejected_rows,
                                     metadata,
                                     ingestion_date,
                                     part_number,
+                                )
+                                record_lineage(
+                                    connection, execution_id=batch_id, batch_id=batch_id,
+                                    source_system=resolved_source_system, source_name=path.name,
+                                    transformation_name="schema_and_row_validation", target_table="quarantine",
+                                    records_read=len(chunk.frame), records_rejected=len(rejected_rows),
                                 )
                                 part_number += 1
 
@@ -280,10 +344,17 @@ class BatchPipeline:
                                 ingestion_date,
                                 part_number + 1,
                             )
+                            record_lineage(
+                                connection, execution_id=batch_id, batch_id=batch_id,
+                                source_system=resolved_source_system, source_name=path.name,
+                                transformation_name="malformed_record_quarantine", target_table="quarantine",
+                                records_read=len(chunk.malformed_rows), records_rejected=len(chunk.malformed_rows),
+                            )
                             part_number += 2
 
                     status = "completed" if counters["ingested"] else "empty"
-                    self._refresh_layers(connection)
+                    self._refresh_layers(connection, batch_id=batch_id, source_file=path.name,
+                                         source_system=resolved_source_system)
                     self._finish_batch(connection, batch_id, status, counters, None)
                     result = self._result(batch_id, path.name, resolved_source_type, status, counters)
                     self._write_audit(result, resolved_source_system, started_at)
@@ -410,6 +481,140 @@ class BatchPipeline:
             connection.close()
         return outcomes
 
+    def reprocess_batch(self, batch_id: str) -> IngestionResult:
+        """Reprocess one completed source batch; business-key upserts stay idempotent."""
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT source_file, source_type, source_system, file_fingerprint "
+                "FROM batch_history WHERE batch_id = ?",
+                [batch_id],
+            ).fetchone()
+        finally:
+            connection.close()
+        if not row:
+            raise ValueError(f"Unknown batch_id: {batch_id}")
+        source = self.incoming_dir / row[0]
+        if not source.is_file():
+            raise FileNotFoundError(f"Backfill source file is no longer available: {source}")
+        current_fingerprint = self._fingerprint(source, SourceType(row[1]), row[2])
+        if current_fingerprint != row[3]:
+            raise ValueError(f"Source file {source.name!r} no longer matches batch {batch_id}; restore its archived bytes")
+        return self.ingest_file(source, row[1], source_system=row[2], reprocess=True)
+
+    def rebuild_silver(self) -> dict[str, int]:
+        """Rebuild current Silver from retained accepted event Parquet partitions."""
+        if self.settings.storage_backend != "local":
+            raise RuntimeError("Silver rebuild from retained event files currently requires STORAGE_BACKEND=local")
+        event_root = self.data_root / "silver" / "events"
+        files = sorted(event_root.rglob("*.parquet")) if event_root.exists() else []
+        if not files:
+            raise FileNotFoundError(f"No retained Silver event Parquet files under {event_root}")
+        glob = str(event_root / "**" / "*.parquet").replace("'", "''")
+        dependent_files = [path for path in files if "source_type=dependents" in path.as_posix()]
+        dependent_glob = str(event_root / "**" / "source_type=dependents" / "**" / "*.parquet").replace("'", "''")
+        connection = self._connect()
+        execution_id = f"rebuild-silver-{uuid.uuid4().hex}"
+        started = datetime.now(timezone.utc)
+        try:
+            available_columns = {
+                row[0] for row in connection.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{glob}', union_by_name=true)"
+                ).fetchall()
+            }
+            ingest_order = ("try_cast(ingestion_timestamp AS TIMESTAMP)" if "ingestion_timestamp" in available_columns
+                            else "NULL::TIMESTAMP")
+            batch_order = "batch_id" if "batch_id" in available_columns else "''"
+            connection.execute("BEGIN TRANSACTION")
+            connection.execute(
+                f"""CREATE OR REPLACE TEMP TABLE rebuilt_employee_master AS
+                    SELECT {', '.join(f'"{column}"' for column in EMPLOYEE_COLUMNS)}
+                    FROM read_parquet('{glob}', union_by_name=true)
+                    WHERE coalesce(source_type, '') <> 'dependents'
+                    QUALIFY row_number() OVER (PARTITION BY employee_id ORDER BY
+                        try_cast(updated_at AS TIMESTAMP) DESC NULLS LAST,
+                        {ingest_order} DESC NULLS LAST,
+                        {batch_order} DESC) = 1"""
+            )
+            if dependent_files:
+                connection.execute(
+                    f"""CREATE OR REPLACE TEMP TABLE rebuilt_employee_dependents AS
+                        SELECT {', '.join(f'"{column}"' for column in DEPENDENT_COLUMNS)}
+                        FROM read_parquet('{dependent_glob}', union_by_name=true)
+                        QUALIFY row_number() OVER (PARTITION BY dependent_id ORDER BY
+                            try_cast(updated_at AS TIMESTAMP) DESC NULLS LAST,
+                            {ingest_order} DESC NULLS LAST,
+                            {batch_order} DESC) = 1"""
+                )
+            connection.execute("DELETE FROM silver_employee_master")
+            connection.execute(
+                f"INSERT INTO silver_employee_master ({', '.join(EMPLOYEE_COLUMNS)}) "
+                f"SELECT {', '.join(EMPLOYEE_COLUMNS)} FROM rebuilt_employee_master"
+            )
+            if dependent_files:
+                connection.execute("DELETE FROM silver_employee_dependents")
+                connection.execute(
+                    f"INSERT INTO silver_employee_dependents ({', '.join(DEPENDENT_COLUMNS)}) "
+                    f"SELECT {', '.join(DEPENDENT_COLUMNS)} FROM rebuilt_employee_dependents"
+                )
+            employees = int(connection.execute("SELECT count(*) FROM silver_employee_master").fetchone()[0])
+            dependents = int(connection.execute("SELECT count(*) FROM silver_employee_dependents").fetchone()[0])
+            connection.execute("COMMIT")
+            record_lineage(connection, execution_id=execution_id, batch_id=None,
+                           source_system="local_parquet", source_name=str(event_root),
+                           transformation_name="rebuild_silver", target_table="silver_employee_master",
+                           records_read=len(files), records_written=employees)
+            record_lineage(connection, execution_id=execution_id, batch_id=None,
+                           source_system="local_parquet", source_name=str(event_root),
+                           transformation_name="rebuild_silver", target_table="silver_employee_dependents",
+                           records_read=len(files), records_written=dependents)
+            finished = datetime.now(timezone.utc)
+            record_batch_audit(connection, execution_id=execution_id, batch_id=execution_id,
+                               source_name=str(event_root), start_time=started, end_time=finished,
+                               status="completed", records_read=len(files),
+                               records_written=employees + dependents)
+            self._refresh_layers(connection, batch_id=execution_id, source_file=str(event_root),
+                                 source_system="local_parquet")
+            return {"employee_rows": employees, "dependent_rows": dependents, "event_files": len(files)}
+        except Exception as error:
+            try:
+                connection.execute("ROLLBACK")
+            except duckdb.Error:
+                pass
+            finished = datetime.now(timezone.utc)
+            record_batch_audit(connection, execution_id=execution_id, batch_id=execution_id,
+                               source_name=str(event_root), start_time=started, end_time=finished,
+                               status="failed", error_message=str(error))
+            raise
+        finally:
+            connection.close()
+
+    def rebuild_gold(self) -> dict[str, int]:
+        """Regenerate Gold from current Silver tables and refresh Parquet snapshots."""
+        connection = self._connect()
+        execution_id = f"rebuild-gold-{uuid.uuid4().hex}"
+        started = datetime.now(timezone.utc)
+        try:
+            self._refresh_layers(connection, batch_id=execution_id, source_file="Silver state",
+                                 source_system="duckdb")
+            result = {
+                table: int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                for table in ("gold_employee_master", "gold_employee_dependents",
+                              "gold_company_employee_summary", "gold_policy_summary")
+            }
+            record_batch_audit(connection, execution_id=execution_id, batch_id=execution_id,
+                               source_name="Silver state", start_time=started,
+                               end_time=datetime.now(timezone.utc), status="completed",
+                               records_read=sum(result.values()), records_written=sum(result.values()))
+            return result
+        except Exception as error:
+            record_batch_audit(connection, execution_id=execution_id, batch_id=execution_id,
+                               source_name="Silver state", start_time=started,
+                               end_time=datetime.now(timezone.utc), status="failed", error_message=str(error))
+            raise
+        finally:
+            connection.close()
+
     def report(self) -> dict[str, Any]:
         """Return current layer sizes and the most recent batch outcomes."""
         connection = self._connect()
@@ -432,6 +637,7 @@ class BatchPipeline:
                 "active_dependents": int(dependent_count),
                 "recent_batches": batches.to_dict(orient="records"),
                 "duckdb_path": str(self.database_path),
+                "monitoring": monitoring_snapshot(connection),
             }
         finally:
             connection.close()
@@ -479,6 +685,7 @@ class BatchPipeline:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS batch_history_fingerprint_idx ON batch_history(file_fingerprint)"
             )
+            ensure_reliability_tables(connection)
         finally:
             connection.close()
 
@@ -508,6 +715,37 @@ class BatchPipeline:
                 digest.update(block)
         return digest.hexdigest()
 
+    def _infer_schema_types(self, path: Path, columns: list[str]) -> dict[str, str]:
+        """Infer a bounded sample type profile without reading the full source twice."""
+        sample = next(iter_input_chunks(path, min(self.settings.batch_chunk_size, 250)), None)
+        frame = sample.frame if sample is not None else pd.DataFrame(columns=columns)
+        types: dict[str, str] = {}
+        id_columns = {column for column in columns if column.endswith("_id") or column == "id"}
+        date_columns = {"date_of_birth", "joining_date", "effective_start_date", "effective_end_date"}
+        timestamp_columns = {"created_at", "updated_at", "ingestion_timestamp"}
+        for column in columns:
+            values = frame[column].dropna().astype("string").str.strip()
+            values = values[values.ne("")]
+            if not len(values):
+                types[column] = "NULL"
+            elif column in id_columns:
+                types[column] = "STRING"
+            elif column in timestamp_columns:
+                parsed = pd.to_datetime(values, errors="coerce", format="mixed")
+                types[column] = "TIMESTAMP" if parsed.notna().all() else "STRING"
+            elif column in date_columns:
+                parsed = pd.to_datetime(values, errors="coerce", format="mixed")
+                types[column] = "DATE" if parsed.notna().all() else "STRING"
+            else:
+                numeric = pd.to_numeric(values.str.replace(",", "", regex=False), errors="coerce")
+                if numeric.notna().all():
+                    types[column] = "INT64" if (numeric % 1 == 0).all() else "NUMERIC"
+                elif numeric.notna().any():
+                    types[column] = "MIXED"
+                else:
+                    types[column] = "STRING"
+        return types
+
     def _start_batch(
         self,
         connection,
@@ -532,9 +770,14 @@ class BatchPipeline:
                 datetime.fromisoformat(started_at),
             ],
         )
+        parsed_start = datetime.fromisoformat(started_at)
+        record_batch_audit(
+            connection, execution_id=batch_id, batch_id=batch_id, source_name=source_file,
+            start_time=parsed_start, end_time=None, status="running",
+        )
 
-    @staticmethod
     def _finish_batch(
+        self,
         connection,
         batch_id: str,
         status: str,
@@ -556,6 +799,17 @@ class BatchPipeline:
                 batch_id,
             ],
         )
+        batch = connection.execute(
+            "SELECT source_file, started_at, rows_ingested, rows_loaded, rows_rejected "
+            "FROM batch_history WHERE batch_id = ?", [batch_id]
+        ).fetchone()
+        if batch:
+            record_batch_audit(
+                connection, execution_id=batch_id, batch_id=batch_id, source_name=batch[0],
+                start_time=batch[1], end_time=datetime.now(timezone.utc), status=status,
+                records_read=int(batch[2]), records_written=int(batch[3]),
+                records_rejected=int(batch[4]), error_message=error_message,
+            )
 
     def _reference_ids(self, connection) -> tuple[set[str], set[str], set[str]]:
         all_employee_ids = {
@@ -584,7 +838,7 @@ class BatchPipeline:
         part_number: int,
     ) -> list[dict[str, Any]]:
         if source_type is not SourceType.DELETIONS:
-            return rows
+            return [{**row, **metadata} for row in rows]
         full_rows: list[dict[str, Any]] = []
         for deletion in rows:
             current = connection.execute(
@@ -596,10 +850,10 @@ class BatchPipeline:
             employee = dict(zip(EMPLOYEE_COLUMNS, current))
             employee["record_status"] = "deleted"
             employee["updated_at"] = deletion.get("updated_at") or self._now()
-            full_rows.append(employee)
+            full_rows.append({**employee, **metadata})
         return full_rows
 
-    def _apply_records(self, connection, rows: list[dict[str, Any]], source_type: SourceType) -> None:
+    def _apply_records(self, connection, rows: list[dict[str, Any]], source_type: SourceType) -> int:
         if source_type is SourceType.DEPENDENTS:
             columns = DEPENDENT_COLUMNS
             table = "silver_employee_dependents"
@@ -611,10 +865,30 @@ class BatchPipeline:
         connection.register(relation_name, frame)
         try:
             selected_columns = ", ".join(columns)
-            connection.execute(
-                f"INSERT OR REPLACE INTO {table} ({selected_columns}) "
-                f"SELECT {selected_columns} FROM {relation_name}"
+            key = "dependent_id" if source_type is SourceType.DEPENDENTS else "employee_id"
+            assignments = ", ".join(f"{column}=excluded.{column}" for column in columns if column != key)
+            current_time = (
+                f"coalesce(try_cast({table}.updated_at AS TIMESTAMP), "
+                f"try_cast({table}.created_at AS TIMESTAMP), TIMESTAMP '1970-01-01 00:00:00')"
             )
+            incoming_time = (
+                "coalesce(try_cast(excluded.updated_at AS TIMESTAMP), "
+                "try_cast(excluded.created_at AS TIMESTAMP), TIMESTAMP '1970-01-01 00:00:00')"
+            )
+            condition = f"{incoming_time} > {current_time} OR {incoming_time} = {current_time}"
+            if source_type is not SourceType.DEPENDENTS:
+                condition = (
+                    f"{incoming_time} > {current_time} OR "
+                    f"({incoming_time} = {current_time} AND "
+                    f"(excluded.record_status = 'deleted' OR {table}.record_status <> 'deleted'))"
+                )
+            connection.execute(
+                f"INSERT INTO {table} ({selected_columns}) "
+                f"SELECT {selected_columns} FROM {relation_name} "
+                f"ON CONFLICT ({key}) DO UPDATE SET {assignments} WHERE {condition} "
+                f"RETURNING {key}"
+            )
+            return len(connection.fetchall())
         finally:
             connection.unregister(relation_name)
 
@@ -645,7 +919,8 @@ class BatchPipeline:
             part_number,
         )
 
-    def _refresh_layers(self, connection) -> None:
+    def _refresh_layers(self, connection, batch_id: str | None = None,
+                        source_file: str | None = None, source_system: str | None = None) -> None:
         connection.execute(
             """CREATE OR REPLACE TABLE gold_employee_master AS
                SELECT * FROM silver_employee_master WHERE record_status = 'active'"""
@@ -682,6 +957,13 @@ class BatchPipeline:
                 connection,
                 f"SELECT * FROM {table}",
                 Path(relative_path),
+            )
+            row_count = int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+            record_lineage(
+                connection, execution_id=batch_id, batch_id=batch_id,
+                source_system=source_system or "duckdb", source_name=source_file or table,
+                transformation_name="refresh_analytical_snapshot", target_table=table,
+                records_read=row_count, records_written=row_count,
             )
 
     def _write_audit(

@@ -626,3 +626,121 @@ The required local run is the `streamlake_batch_ingestion` DAG. Wait for all
 tasks, including Spark and dbt, to finish successfully before considering
 Phase 4 complete. Airflow task logs are the source for live task start/end
 times; the audit report captures pipeline-level timing and record counts.
+
+## Phase 6: Reliability, Lineage, and Operations
+
+The reliability tables are stored alongside the data plane in DuckDB rather
+than in an in-memory dashboard. Batch ingestion populates `batch_history`,
+`pipeline_audit`, `data_lineage`, `pipeline_metrics`, and `schema_registry` from
+the actual file counts, accepted/rejected rows, transformations, and elapsed
+times. CDC writes audit and lineage records in its DuckDB transaction, and
+records broker lag only after comparing offsets in the processed microbatch to
+the broker's latest offsets. If the broker/API is unavailable, lag is omitted
+and a collection warning is logged; it is never shown as zero. Event latency is
+measured from Debezium event time to Kafka record time when both timestamps
+exist. Airflow task failure and retry callbacks record their actual run/task
+IDs and attempt numbers.
+
+Inspect the current operational data with DuckDB:
+
+```zsh
+python - <<'PY'
+import duckdb
+db = duckdb.connect("data/streamlake.duckdb", read_only=True)
+print(db.execute("SELECT * FROM pipeline_audit ORDER BY start_time DESC LIMIT 20").df())
+print(db.execute("SELECT * FROM data_lineage ORDER BY processing_timestamp DESC LIMIT 50").df())
+print(db.execute("SELECT metric_name, sum(metric_value), max(observed_at) FROM pipeline_metrics GROUP BY 1 ORDER BY 1").df())
+print(db.execute("SELECT * FROM schema_registry ORDER BY source_type, schema_version").df())
+PY
+```
+
+### Idempotency and schema changes
+
+`batch_history.file_fingerprint` is a SHA-256 of source bytes, source type, and
+source system. A completed file replay is skipped. Intentional reprocessing
+uses the same business-key upserts, so current Silver records are not
+duplicated. CDC replay is protected by the `cdc_event_ledger` event IDs and
+source ordering checks. Preserve the ledger and checkpoints during recovery.
+
+Every distinct input column/type profile is versioned by source type. Additive
+optional columns and removal of optional columns are backward-compatible and
+remain preserved in Bronze; existing transformations ignore unknown fields.
+Missing required columns and incompatible type changes are recorded as
+incompatible. Rows affected by a changed type are written to Quarantine with
+the schema-drift reason. A required-column removal also records the header in
+Quarantine and fails that file's execution. Migrate by adding a new optional
+field first, updating consumers to accept it, and only then removing an old
+field. Type changes should use a new field or a reviewed migration; do not
+reinterpret old Parquet files in place. CDC Debezium schemas are versioned by
+source table using the same registry.
+
+### Retry, recovery, and backfill
+
+- Re-run a file safely with `streamlake reprocess-batch --batch-id <batch-id>`.
+  The original file must remain in `data/incoming`; the replay gets a new
+  execution ID and business keys are upserted.
+- Rebuild current Silver from retained accepted event Parquet with
+  `streamlake rebuild-silver`, then rebuild Gold with `streamlake rebuild-gold`.
+  These commands require `STORAGE_BACKEND=local` and fail clearly if event
+  history is missing.
+- In Airflow, trigger `streamlake_batch_ingestion` with `batch_id`, or with
+  `start_date` and `end_date`, to select historical source files. Set
+  `reprocess=true` when selecting already completed fingerprints. Keep archived
+  input versions; the pipeline cannot recreate a changed or deleted source file
+  from its fingerprint alone.
+- For CDC replay, retain Kafka topic data, the event ledger, and current
+  checkpoint. To deliberately reread offsets, start a separate consumer query
+  with a new `CDC_QUERY_NAME` (therefore a new checkpoint and non-colliding
+  Bronze batch paths) and a `CDC_STARTING_OFFSETS` JSON map, for example:
+  `{"employee_changes":{"0":123}}`. The offset setting applies only to a new
+  query; a query resumed from its existing checkpoint uses its checkpointed
+  offsets. Spark's pinned Kafka connector accepts `earliest`, `latest`, or a
+  per-topic/partition offset JSON value. Keep the event ledger so replayed
+  event IDs remain idempotent. [Spark 4.0.1 Kafka offset and checkpoint behavior](https://spark.apache.org/docs/4.0.1/streaming/structured-streaming-kafka-integration.html).
+- Replay corrected dead letters from JSONL using the original source topic and
+  corrected key/value. The command validates the corrected CDC envelope and
+  Kafka delivery before it exits:
+
+```zsh
+cat > corrected-events.jsonl <<'JSONL'
+{"source_topic":"employee_changes","key":"{\"payload\":{\"employee_id\":\"EMP-1\"}}","value":{"payload":{"before":null,"after":{"employee_id":"EMP-1"},"source":{"table":"employees","lsn":123},"op":"u"}}}
+JSONL
+python scripts/replay_corrected_dlq.py --input corrected-events.jsonl
+```
+
+The original dead-letter row retains source topic, partition, offset, raw key
+and value, error message, and failure timestamp. The replay producer uses
+idempotent Kafka producer settings; broker-assigned offsets are new.
+
+### Alerts and performance
+
+Airflow retries are recorded through `on_retry_callback`; exhausted task failures
+are persisted and sent through the shared alert path. Without SMTP settings,
+alerts are logged. Configure `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`,
+`SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `ALERT_TO_EMAIL`, and `SMTP_USE_TLS` in an
+ignored `.env` or runtime environment. Never commit credentials. Spark consumer
+lag collection uses the optional `confluent-kafka` dependency in the `streaming`
+extra and queries actual broker end offsets. Kafka unavailable, GCS unavailable,
+BigQuery job failures, and database failures remain surfaced as errors for task
+retry; they do not generate success metrics.
+
+The batch pipeline processes bounded chunks and writes compressed Parquet
+without repartitioning each chunk. Spark output follows source partitions and
+event-date/source-table partitioning; avoid adding repartition calls for small
+microbatches because that creates shuffle and small files. BigQuery tables keep
+event/ingestion date partitioning and key clustering; filter queries on those
+partition columns. Current Gold snapshots still scan current Silver state when
+refreshed; use the recorded `execution_seconds` metrics to identify when a
+larger deployment needs incremental materialization. No benchmark numbers are
+invented by the monitoring layer.
+
+Run reliability and failure simulation tests:
+
+```zsh
+PYSPARK_SUBMIT_ARGS='--driver-memory 512m --conf spark.sql.shuffle.partitions=4 --conf spark.default.parallelism=4 pyspark-shell' \
+  python -m pytest -q
+```
+
+The GCP integration test stays skipped unless `RUN_GCP_INTEGRATION=1` and valid
+ADC, project, bucket, APIs, and IAM permissions are configured. Unit failure
+simulations use fake GCS/BigQuery/Kafka services and do not need cloud access.

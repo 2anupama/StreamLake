@@ -37,6 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--input-dir", type=Path, default=Path("data/incoming"))
 
     commands.add_parser("report", help="Report current Silver/Gold state and recent batch history")
+    backfill = commands.add_parser("reprocess-batch", help="Replay one retained batch by batch ID")
+    backfill.add_argument("--batch-id", required=True)
+    commands.add_parser("rebuild-silver", help="Rebuild Silver from retained accepted event Parquet")
+    commands.add_parser("rebuild-gold", help="Rebuild Gold snapshots from Silver")
     return parser
 
 
@@ -64,6 +68,15 @@ def run_cli(argv: Sequence[str], settings: Settings | None = None) -> int:
             return 1 if any(item.get("status") == "invalid" for item in outcomes) else 0
         if args.command == "report":
             print(json.dumps(pipeline.report(), indent=2, default=str))
+            return 0
+        if args.command == "reprocess-batch":
+            _print_results([pipeline.reprocess_batch(args.batch_id)])
+            return 0
+        if args.command == "rebuild-silver":
+            print(json.dumps(pipeline.rebuild_silver(), indent=2))
+            return 0
+        if args.command == "rebuild-gold":
+            print(json.dumps(pipeline.rebuild_gold(), indent=2))
             return 0
     except Exception as error:
         logger.error("Batch command failed: %s", error, exc_info=True)

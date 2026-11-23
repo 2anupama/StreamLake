@@ -49,6 +49,7 @@ def test_main_pipeline_task_chain_and_retries(dagbag):
         assert task.retry_delay == timedelta(minutes=1)
         assert task.execution_timeout == timedelta(hours=2)
         assert task.on_failure_callback is not None
+        assert task.on_retry_callback is not None
     assert dag.catchup is False
     assert dag.max_active_runs == 1
 

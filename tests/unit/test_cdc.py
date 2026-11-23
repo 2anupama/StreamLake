@@ -228,6 +228,15 @@ def test_duckdb_batch_deduplicates_merges_updates_and_keeps_deletes(tmp_path) ->
     result = _apply_duckdb_batch(tmp_path / "cdc.duckdb", stage_path, settings)
 
     assert result == {"input": 3, "deduplicated": 3, "applied": 1, "rejected": 0}
+    import duckdb
+    monitoring_db = duckdb.connect(str(tmp_path / "cdc.duckdb"), read_only=True)
+    try:
+        audit = monitoring_db.execute("SELECT records_read, records_written FROM pipeline_audit WHERE pipeline_name='streamlake_cdc_streaming'").fetchone()
+        metric_names = {row[0] for row in monitoring_db.execute("SELECT DISTINCT metric_name FROM pipeline_metrics WHERE pipeline_name='streamlake_cdc_streaming'").fetchall()}
+    finally:
+        monitoring_db.close()
+    assert audit == (3, 1)
+    assert {"records_deduplicated", "records_rejected", "execution_seconds"}.issubset(metric_names)
     silver = pd.read_parquet(settings.cdc_silver_path)
     assert len(silver) == 1
     assert silver.iloc[0]["record_status"] == "active"

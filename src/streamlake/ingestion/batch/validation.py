@@ -114,6 +114,8 @@ def validate_chunk(
     active_employee_ids: set[str] | None = None,
     existing_dependent_ids: set[str] | None = None,
     seen_ids: set[str] | None = None,
+    allow_existing_ids: set[str] | None = None,
+    allow_existing_dependent_ids: set[str] | None = None,
 ) -> ValidationResult:
     """Clean one input chunk and return accepted rows and rejection details.
 
@@ -125,6 +127,8 @@ def validate_chunk(
     active_employee_ids = active_employee_ids or set()
     existing_dependent_ids = existing_dependent_ids or set()
     seen_ids = seen_ids if seen_ids is not None else set()
+    allow_existing_ids = allow_existing_ids or set()
+    allow_existing_dependent_ids = allow_existing_dependent_ids or set()
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, str]] = []
 
@@ -137,7 +141,7 @@ def validate_chunk(
                 errors.append("Missing employee_id")
             elif employee_id in seen_ids:
                 errors.append("Duplicate employee_id in source file")
-            elif employee_id not in active_employee_ids:
+            elif employee_id not in active_employee_ids and employee_id not in allow_existing_ids:
                 errors.append("Employee does not exist or is already deleted")
             updated_at = _standardize_timestamp(record.get("updated_at"))
             if record.get("updated_at") and updated_at is None:
@@ -162,9 +166,9 @@ def validate_chunk(
                 errors.append("Missing employee_id")
             elif employee_id in seen_ids:
                 errors.append("Duplicate employee_id in source file")
-            elif source_type is SourceType.ADDITIONS and employee_id in all_employee_ids:
+            elif source_type is SourceType.ADDITIONS and employee_id in all_employee_ids and employee_id not in allow_existing_ids:
                 errors.append("Employee ID already exists")
-            elif source_type is SourceType.UPDATES and employee_id not in active_employee_ids:
+            elif source_type is SourceType.UPDATES and employee_id not in active_employee_ids and employee_id not in allow_existing_ids:
                 errors.append("Employee update references an unknown or deleted employee")
 
             for field in EMPLOYEE_REQUIRED_FIELDS:
@@ -229,7 +233,7 @@ def validate_chunk(
             errors.append("Dependent references an unknown or deleted employee")
         if not dependent_id:
             errors.append("Missing dependent_id")
-        elif dependent_id in existing_dependent_ids or dependent_id in seen_ids:
+        elif (dependent_id in existing_dependent_ids and dependent_id not in allow_existing_dependent_ids) or dependent_id in seen_ids:
             errors.append("Duplicate dependent_id")
         for field in ("dependent_name", "gender", "date_of_birth", "relationship", "record_status"):
             if not record.get(field):

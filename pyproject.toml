@@ -48,7 +48,13 @@ gcp = [
     "google-cloud-storage==3.4.1",
 ]
 dbt = [
+    "dbt-core==1.11.17",
     "dbt-bigquery==1.10.2",
+]
+phase3 = [
+    "pyspark==4.0.1",
+    "dbt-core==1.11.17",
+    "dbt-duckdb==1.10.1",
 ]
 
 [project.scripts]

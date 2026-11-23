@@ -1,0 +1,39 @@
+version: 2
+models:
+  - name: stg_employees
+    description: Cleaned latest employee business state with source lineage.
+    columns:
+      - name: employee_id
+        description: Stable employee business key.
+        data_tests: [not_null, unique]
+      - name: normalized_email
+        description: Lowercase, trimmed email used by downstream marts.
+  - name: stg_employee_history
+    description: Employee change history with Spark-computed SCD2 validity intervals.
+    columns:
+      - name: employee_sk
+        description: Deterministic employee version surrogate key.
+        data_tests: [not_null, unique]
+      - name: employee_id
+        description: Employee business key.
+        data_tests: [not_null]
+  - name: stg_dependents
+    description: Validated dependents whose employee business key exists.
+    columns:
+      - name: dependent_id
+        data_tests: [not_null, unique]
+  - name: stg_companies
+    description: Aggregated active employee and policy totals by company.
+    columns:
+      - name: company_id
+        data_tests: [not_null, unique]
+  - name: stg_policies
+    description: Policy enrollment totals by policy and company.
+    columns:
+      - name: policy_id
+        data_tests: [not_null]
+  - name: stg_employee_changes
+    description: Employee change events with event and ingestion metadata.
+    columns:
+      - name: event_id
+        data_tests: [not_null, unique]

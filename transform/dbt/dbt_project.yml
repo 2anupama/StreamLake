@@ -1,0 +1,19 @@
+name: streamlake_transform
+version: '1.0.0'
+config-version: 2
+profile: streamlake
+model-paths: [models]
+test-paths: [tests]
+snapshot-paths: [snapshots]
+clean-targets: [target, dbt_packages]
+vars:
+  phase3_data_root: ../../data/phase3/silver
+models:
+  streamlake_transform:
+    staging:
+      +materialized: view
+    intermediate:
+      +materialized: ephemeral
+    marts:
+      +materialized: table
+      +on_table_exists: drop

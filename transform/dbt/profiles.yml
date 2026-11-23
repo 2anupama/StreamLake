@@ -1,0 +1,15 @@
+streamlake:
+  target: local
+  outputs:
+    local:
+      type: duckdb
+      path: "../../data/streamlake_phase3.duckdb"
+      threads: 4
+    bigquery:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT_ID') }}"
+      dataset: "{{ env_var('BIGQUERY_DATASET', 'streamlake') }}"
+      threads: 4
+      location: "{{ env_var('BIGQUERY_LOCATION', 'US') }}"
+      priority: interactive

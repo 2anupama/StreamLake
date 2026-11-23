@@ -1,0 +1,77 @@
+version: 2
+models:
+  - name: dim_employee
+    description: SCD Type 2 employee dimension; each version has an effective interval.
+    columns:
+      - name: employee_sk
+        description: Surrogate key for an employee version.
+        data_tests: [not_null, unique]
+      - name: employee_bk
+        description: Source employee business key.
+        data_tests: [not_null]
+      - name: is_current
+        description: True for the latest version of the employee.
+        data_tests: [not_null]
+  - name: dim_company
+    description: Company dimension with current enrollment measures.
+    columns:
+      - name: company_sk
+        data_tests: [not_null, unique]
+      - name: company_bk
+        data_tests: [not_null, unique]
+  - name: dim_policy
+    description: Policy dimension keyed by policy and company.
+    columns:
+      - name: policy_sk
+        data_tests: [not_null, unique]
+      - name: policy_bk
+        data_tests: [not_null]
+  - name: dim_date
+    description: Calendar dimension spanning enrollment and employee history dates.
+    columns:
+      - name: date_sk
+        data_tests: [not_null, unique]
+      - name: date_day
+        data_tests: [not_null, unique]
+  - name: dim_department
+    description: Department dimension with active employee counts.
+    columns:
+      - name: department_sk
+        data_tests: [not_null, unique]
+  - name: fact_employee_enrollment
+    description: Employee enrollment facts at employee and enrollment-date grain.
+    columns:
+      - name: enrollment_sk
+        data_tests: [not_null, unique]
+      - name: employee_bk
+        data_tests: [not_null]
+  - name: fact_employee_changes
+    description: Append-oriented employee change event facts.
+    columns:
+      - name: employee_change_sk
+        data_tests: [not_null, unique]
+      - name: operation
+        data_tests:
+          - accepted_values:
+              arguments: {values: ['c', 'u', 'd', 'insert', 'update', 'delete']}
+  - name: fact_policy_utilization
+    description: Enrollment and sum-insured utilization by policy and company.
+    columns:
+      - name: policy_utilization_sk
+        data_tests: [not_null, unique]
+  - name: employee_enrollment_summary
+    description: Business enrollment summary by company and policy.
+  - name: company_employee_count
+    description: Current active employee totals by company.
+  - name: dependent_distribution
+    description: Dependent counts by company, policy, and relationship.
+  - name: sum_insured_distribution
+    description: Enrollment and insured amounts grouped into coverage bands.
+  - name: monthly_employee_additions
+    description: Employee additions grouped by calendar month.
+  - name: monthly_employee_deletions
+    description: Employee deletions grouped by calendar month.
+  - name: employee_changes_history
+    description: Business-facing view of employee change history.
+  - name: policy_wise_enrollment
+    description: Enrollment and insured totals by policy.

@@ -1,15 +1,32 @@
 annotated-types==0.8.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
 coverage==7.17.3
+duckdb==1.4.1
+et_xmlfile==2.0.0
+Faker==37.11.0
+idna==3.20
 iniconfig==2.3.1
+numpy==2.4.6
+openpyxl==3.1.5
 packaging==26.3
+pandas==2.3.3
 pluggy==1.7.0
+pyarrow==21.0.0
 pydantic==2.14.3
 pydantic-settings==2.10.1
 pydantic_core==2.50.4
 Pygments==2.21.0
 pytest==8.4.2
 pytest-cov==7.0.0
+python-dateutil==4.0.0
 python-dotenv==1.1.1
--e .[dev]
+pytz==2026.6
+requests==2.32.5
+# Editable Git install with no remote (streamlake==0.1.0)
+-e .
 typing-inspection==0.4.5
 typing_extensions==4.16.0
+tzdata==2026.6
+urllib3==2.8.0
+xlrd==2.0.2

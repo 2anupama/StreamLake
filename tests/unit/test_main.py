@@ -12,7 +12,7 @@ def test_main_starts_successfully(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("ENABLE_FILE_LOGGING", "true")
     monkeypatch.setenv("LOG_FILE", str(tmp_path / "streamlake.log"))
 
-    assert main() == 0
+    assert main([]) == 0
     assert (tmp_path / "streamlake.log").exists()
 
 

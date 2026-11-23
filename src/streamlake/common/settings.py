@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,7 +30,11 @@ class Settings(BaseSettings):
     postgres_password: SecretStr | None = None
 
     kafka_bootstrap_servers: str = "localhost:9092"
+    data_root: Path = Path("data")
     duckdb_path: Path = Path("data/streamlake.duckdb")
+    ingestion_audit_path: Path = Path("logs/ingestion_audit.jsonl")
+    batch_chunk_size: int = Field(default=2_000, gt=0)
+    source_system: str = "local"
 
     gcp_project_id: str | None = None
     gcs_bucket: str | None = None
